@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Proxy Firewall Dashboard</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <main class="page">
+    <section class="hero">
+      <div>
+        <p class="eyebrow">Proxy Firewall Control Center</p>
+        <h1>Real-time traffic, anomaly alerts, and blocking controls</h1>
+        <p class="subtext">The dashboard refreshes automatically every few seconds so you can watch the firewall and anomaly detector together.</p>
+      </div>
+      <div class="legend">
+        <span class="legend-item safe">Normal</span>
+        <span class="legend-item medium">Warning</span>
+        <span class="legend-item danger">Critical</span>
+      </div>
+    </section>
+
+    <section class="stats-grid">
+      <article class="stat-card">
+        <span>Total Requests</span>
+        <strong id="totalRequests">0</strong>
+      </article>
+      <article class="stat-card">
+        <span>Total Anomalies</span>
+        <strong id="totalAnomalies">0</strong>
+      </article>
+      <article class="stat-card">
+        <span>Blocked IPs</span>
+        <strong id="blockedIps">0</strong>
+      </article>
+      <article class="stat-card">
+        <span>Open Sessions</span>
+        <strong id="openConnections">0</strong>
+      </article>
+    </section>
+
+    <section class="two-column">
+      <article class="panel">
+        <div class="panel-header">
+          <h2>Traffic Trend</h2>
+        </div>
+        <canvas id="requestsChart"></canvas>
+      </article>
+      <article class="panel">
+        <div class="panel-header">
+          <h2>Anomaly Trend</h2>
+        </div>
+        <canvas id="anomalyChart"></canvas>
+      </article>
+    </section>
+
+    <section class="two-column">
+      <article class="panel">
+        <div class="panel-header">
+          <h2>Live Alerts</h2>
+        </div>
+        <div class="table-wrap alerts-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Severity</th>
+                <th>IP</th>
+                <th>Reason</th>
+              </tr>
+            </thead>
+            <tbody id="alertsTable"></tbody>
+          </table>
+        </div>
+      </article>
+      <article class="panel">
+        <div class="panel-header">
+          <h2>Suspicious IPs</h2>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>IP</th>
+                <th>Anomalies</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="suspiciousIpsTable"></tbody>
+          </table>
+        </div>
+      </article>
+    </section>
+
+    <section class="three-column">
+      <article class="panel">
+        <div class="panel-header">
+          <h2>Controls</h2>
+        </div>
+        <form id="settingsForm" class="stack-form">
+          <label>
+            Rate limit per minute
+            <input id="rateLimitInput" type="number" min="10" max="5000">
+          </label>
+          <label class="toggle-row">
+            <input id="idsToggle" type="checkbox">
+            IDS enabled
+          </label>
+          <label class="toggle-row">
+            <input id="dpiToggle" type="checkbox">
+            DPI enabled
+          </label>
+          <label class="toggle-row">
+            <input id="anomalyToggle" type="checkbox">
+            Anomaly detection enabled
+          </label>
+          <label class="toggle-row">
+            <input id="autoBlockToggle" type="checkbox">
+            Auto-block repeated anomalies
+          </label>
+          <button type="submit">Save Settings</button>
+        </form>
+      </article>
+
+      <article class="panel">
+        <div class="panel-header">
+          <h2>Blocked IPs</h2>
+        </div>
+        <form id="blockedIpForm" class="inline-form">
+          <input id="blockedIpInput" placeholder="192.168.1.25">
+          <button type="submit">Add IP</button>
+        </form>
+        <div id="blockedIpsList" class="chip-list"></div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-header">
+          <h2>Blocked Sites</h2>
+        </div>
+        <form id="blockedSiteForm" class="inline-form">
+          <input id="blockedSiteInput" placeholder="example.com">
+          <button type="submit">Add Site</button>
+        </form>
+        <div id="blockedSitesList" class="chip-list"></div>
+      </article>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h2>Recent Logs</h2>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Client IP</th>
+              <th>Host</th>
+              <th>Port</th>
+              <th>Protocol</th>
+              <th>Action</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody id="logsTable"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="/dashboard.js"></script>
+</body>
+</html>

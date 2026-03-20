@@ -1,1 +1,5 @@
-#.\venv\Scripts\Activate.ps1
+from firewall import main
+
+
+if __name__ == "__main__":
+    main()

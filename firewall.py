@@ -8,24 +8,14 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Deque, Dict, List, Optional, Set, Tuple
 
-from flask import Flask, jsonify, render_template_string, request
+from alert_system import AlertSystem
+from anomaly_detector import AnomalyDetector
+
 
 PROXY_HOST = "127.0.0.1"
 PROXY_PORT = 8899
+DASHBOARD_HOST = "127.0.0.1"
 DASHBOARD_PORT = 5000
-
-RATE_LIMIT_PER_MINUTE = 220
-IDS_ENABLED = True
-DPI_ENABLED = True
-BLOCKED_PORTS: Set[int] = {21, 25}
-BLOCKED_IPS: Set[str] = set()
-BLOCKED_SITES: Set[str] = {"youtube.com", "facebook.com"}
-
-DPI_SIGNATURES = [b".exe", b"torrent", b"malware", b"x5o!p%@ap[4\\pzx54(p^)7cc)7}$eicar"]
-MAX_LOGS = 4000
-MAX_ALERTS = 400
-
-state_lock = threading.Lock()
 
 
 @dataclass
@@ -55,531 +45,644 @@ class TimeRule:
     enabled: bool = True
 
 
-logs: Deque[Dict] = deque(maxlen=MAX_LOGS)
-alerts: Deque[Dict] = deque(maxlen=MAX_ALERTS)
-connection_table: Dict[str, ConnectionState] = {}
-schedule_rules: Dict[str, TimeRule] = {}
+class ProxyFirewall:
+    """Main controller for proxy filtering, alerts, and dashboard APIs."""
 
-action_counter: Counter = Counter()
-host_counter: Counter = Counter()
-traffic_series: Deque[Dict] = deque(maxlen=180)
-last_series_key: Optional[str] = None
+    def __init__(self) -> None:
+        self.proxy_host = PROXY_HOST
+        self.proxy_port = PROXY_PORT
+        self.dashboard_host = DASHBOARD_HOST
+        self.dashboard_port = DASHBOARD_PORT
 
-client_rate_window: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=500))
-client_targets_window: Dict[str, Deque[Tuple[float, str]]] = defaultdict(lambda: deque(maxlen=800))
-last_alert_by_key: Dict[str, float] = defaultdict(float)
+        self.rate_limit_per_minute = 220
+        self.ids_enabled = True
+        self.dpi_enabled = True
+        self.anomaly_detection_enabled = True
+        self.auto_block_enabled = False
+        self.auto_block_threshold = 3
 
+        self.blocked_ports: Set[int] = {21, 25}
+        self.blocked_ips: Set[str] = set()
+        self.blocked_sites: Set[str] = {"youtube.com", "facebook.com"}
+        self.dpi_signatures = [
+            b".exe",
+            b"torrent",
+            b"malware",
+            b"x5o!p%@ap[4\\pzx54(p^)7cc)7}$eicar",
+        ]
 
-def now_str() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.max_logs = 4000
+        self.max_alerts = 400
+        self.state_lock = threading.Lock()
 
+        self.logs: Deque[Dict] = deque(maxlen=self.max_logs)
+        self.alerts: Deque[Dict] = deque(maxlen=self.max_alerts)
+        self.connection_table: Dict[str, ConnectionState] = {}
+        self.schedule_rules: Dict[str, TimeRule] = {}
+        self.action_counter: Counter = Counter()
+        self.host_counter: Counter = Counter()
+        self.anomaly_counter: Counter = Counter()
+        self.traffic_series: Deque[Dict] = deque(maxlen=180)
+        self.last_series_key: Optional[str] = None
 
-def normalize_domain(value: str) -> str:
-    d = value.strip().lower()
-    d = d.removeprefix("http://").removeprefix("https://")
-    d = d.split("/")[0]
-    if ":" in d:
-        d = d.split(":")[0]
-    return d
+        self.client_rate_window: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=600))
+        self.client_targets_window: Dict[str, Deque[Tuple[float, str]]] = defaultdict(lambda: deque(maxlen=800))
+        self.last_alert_by_key: Dict[str, float] = defaultdict(float)
 
+        self.anomaly_detector = AnomalyDetector()
+        self.alert_system = AlertSystem(alerts_path="alerts.json")
 
-def push_alert(category: str, message: str, client_ip: str = "") -> None:
-    with state_lock:
-        alerts.appendleft({"time": now_str(), "category": category, "message": message, "client_ip": client_ip})
+    def now_str(self) -> str:
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    @staticmethod
+    def normalize_domain(value: str) -> str:
+        domain = value.strip().lower()
+        domain = domain.removeprefix("http://").removeprefix("https://")
+        domain = domain.split("/")[0]
+        if ":" in domain:
+            domain = domain.split(":")[0]
+        return domain
 
-def push_log(
-    client_ip: str,
-    host: str,
-    port: int,
-    protocol: str,
-    action: str,
-    reason: str = "",
-    up: int = 0,
-    down: int = 0,
-) -> None:
-    with state_lock:
-        logs.appendleft(
-            {
-                "time": now_str(),
-                "client_ip": client_ip,
-                "host": host,
-                "port": port,
-                "protocol": protocol,
-                "action": action,
-                "reason": reason,
-                "up": up,
-                "down": down,
-            }
-        )
-        action_counter[action] += 1
+    def push_alert(
+        self,
+        category: str,
+        message: str,
+        client_ip: str = "",
+        severity: str = "LOW",
+        reason: str = "",
+        features: Optional[Dict] = None,
+    ) -> Dict:
+        alert = {
+            "time": self.now_str(),
+            "category": category,
+            "message": message,
+            "client_ip": client_ip,
+            "severity": severity,
+            "reason": reason or message,
+            "features": features or {},
+        }
+        with self.state_lock:
+            self.alerts.appendleft(alert)
+        return alert
 
+    def push_log(
+        self,
+        client_ip: str,
+        host: str,
+        port: int,
+        protocol: str,
+        action: str,
+        reason: str = "",
+        up: int = 0,
+        down: int = 0,
+    ) -> None:
+        with self.state_lock:
+            self.logs.appendleft(
+                {
+                    "time": self.now_str(),
+                    "client_ip": client_ip,
+                    "host": host,
+                    "port": port,
+                    "protocol": protocol,
+                    "action": action,
+                    "reason": reason,
+                    "up": up,
+                    "down": down,
+                }
+            )
+            self.action_counter[action] += 1
 
-def roll_series(action: str, up: int, down: int) -> None:
-    global last_series_key
-    key = datetime.now().strftime("%H:%M")
-    with state_lock:
-        if key != last_series_key:
-            traffic_series.append({"minute": key, "allowed": 0, "blocked": 0, "up": 0, "down": 0})
-            last_series_key = key
-        bucket = traffic_series[-1]
-        if action == "ALLOWED":
-            bucket["allowed"] += 1
-        else:
-            bucket["blocked"] += 1
-        bucket["up"] += up
-        bucket["down"] += down
-
-
-def is_rate_limited(client_ip: str) -> bool:
-    now = time.time()
-    start = now - 60
-    with state_lock:
-        dq = client_rate_window[client_ip]
-        while dq and dq[0] < start:
-            dq.popleft()
-        if len(dq) >= RATE_LIMIT_PER_MINUTE:
-            return True
-        dq.append(now)
-    return False
-
-
-def detect_intrusion(client_ip: str, host: str) -> None:
-    if not IDS_ENABLED:
-        return
-    now = time.time()
-    start = now - 10
-    with state_lock:
-        dq = client_targets_window[client_ip]
-        dq.append((now, host))
-        while dq and dq[0][0] < start:
-            dq.popleft()
-        req_count = len(dq)
-        distinct = len({h for _, h in dq})
-
-    flood_key = f"{client_ip}:flood"
-    if req_count > 60 and now - last_alert_by_key[flood_key] > 20:
-        last_alert_by_key[flood_key] = now
-        push_alert("IDS", f"Possible flood from {client_ip}: {req_count} req/10s", client_ip)
-
-    scan_key = f"{client_ip}:scan"
-    if distinct > 25 and now - last_alert_by_key[scan_key] > 20:
-        last_alert_by_key[scan_key] = now
-        push_alert("IDS", f"Possible scan from {client_ip}: {distinct} targets/10s", client_ip)
-
-
-def dpi_match(payload: bytes) -> Optional[str]:
-    if not DPI_ENABLED or not payload:
-        return None
-    low = payload.lower()
-    for sig in DPI_SIGNATURES:
-        if sig in low:
-            return f"DPI matched signature: {sig.decode(errors='ignore')}"
-    if b"select " in low and b" union " in low:
-        return "DPI suspicious SQL injection sequence"
-    return None
-
-
-def time_rule_hit(host: str) -> Optional[str]:
-    now = datetime.now()
-    day, hour = now.weekday(), now.hour
-    with state_lock:
-        rules = list(schedule_rules.values())
-    for r in rules:
-        if not r.enabled or r.keyword not in host or day not in r.days:
-            continue
-        in_window = (r.start_hour <= hour < r.end_hour) if r.start_hour < r.end_hour else (hour >= r.start_hour or hour < r.end_hour)
-        if in_window:
-            return f"Time rule ({r.keyword} {r.start_hour:02d}-{r.end_hour:02d})"
-    return None
-
-
-def parse_target(data: bytes) -> Tuple[str, int, str, bytes]:
-    lines = data.split(b"\r\n")
-    if not lines or len(lines[0].split()) < 2:
-        raise ValueError("Bad request line")
-    method = lines[0].split()[0].decode(errors="ignore").upper()
-    if method == "CONNECT":
-        hostport = lines[0].split()[1].decode(errors="ignore")
-        host, port = hostport.rsplit(":", 1)
-        return normalize_domain(host), int(port), "HTTPS", b""
-    host_header = ""
-    for line in lines[1:]:
-        if line.lower().startswith(b"host:"):
-            host_header = line.split(b":", 1)[1].strip().decode(errors="ignore")
-            break
-    if not host_header:
-        raise ValueError("Missing Host header")
-    if ":" in host_header:
-        host, port = host_header.rsplit(":", 1)
-        return normalize_domain(host), int(port), "HTTP", data
-    return normalize_domain(host_header), 80, "HTTP", data
-
-
-def policy_decision(client_ip: str, host: str, port: int) -> Optional[str]:
-    if client_ip in BLOCKED_IPS:
-        return "Blocked source IP"
-    if port in BLOCKED_PORTS:
-        return f"Blocked destination port {port}"
-    if any(x in host for x in BLOCKED_SITES):
-        return "Blocked by site policy"
-    tr = time_rule_hit(host)
-    if tr:
-        return tr
-    return None
-
-
-def tunnel(conn_id: str, client: socket.socket, remote: socket.socket) -> Tuple[int, int]:
-    sockets = [client, remote]
-    up = 0
-    down = 0
-    while True:
-        ready, _, _ = select.select(sockets, [], [], 2)
-        if not ready:
-            with state_lock:
-                c = connection_table.get(conn_id)
-                if c:
-                    c.last_seen = time.time()
-            continue
-        for sock_obj in ready:
-            chunk = sock_obj.recv(8192)
-            if not chunk:
-                return up, down
-            hit = dpi_match(chunk)
-            if hit:
-                push_alert("DPI", hit)
-                return up, down
-            if sock_obj is client:
-                remote.sendall(chunk)
-                up += len(chunk)
-                with state_lock:
-                    c = connection_table.get(conn_id)
-                    if c:
-                        c.up += len(chunk)
-                        c.up_packets += 1
-                        c.last_seen = time.time()
+    def roll_series(self, action: str, up: int, down: int, anomaly_count: int = 0) -> None:
+        key = datetime.now().strftime("%H:%M")
+        with self.state_lock:
+            if key != self.last_series_key:
+                self.traffic_series.append(
+                    {
+                        "minute": key,
+                        "allowed": 0,
+                        "blocked": 0,
+                        "anomalies": 0,
+                        "up": 0,
+                        "down": 0,
+                    }
+                )
+                self.last_series_key = key
+            bucket = self.traffic_series[-1]
+            if action == "ALLOWED":
+                bucket["allowed"] += 1
             else:
-                client.sendall(chunk)
-                down += len(chunk)
-                with state_lock:
-                    c = connection_table.get(conn_id)
-                    if c:
-                        c.down += len(chunk)
-                        c.down_packets += 1
-                        c.last_seen = time.time()
+                bucket["blocked"] += 1
+            bucket["anomalies"] += anomaly_count
+            bucket["up"] += up
+            bucket["down"] += down
 
+    def register_request(self, client_ip: str) -> Tuple[int, float]:
+        # Keep a rolling time window per IP so we can calculate both
+        # requests-per-minute and requests-per-second style features.
+        now = time.time()
+        start_60 = now - 60
+        start_10 = now - 10
+        with self.state_lock:
+            window = self.client_rate_window[client_ip]
+            window.append(now)
+            while window and window[0] < start_60:
+                window.popleft()
+            recent_count = sum(1 for ts in window if ts >= start_10)
+            request_count = len(window)
+        request_frequency = round(recent_count / 10, 2)
+        return request_count, request_frequency
 
-def handle_client(client: socket.socket, addr: Tuple[str, int]) -> None:
-    client_ip = addr[0]
-    conn_id = str(uuid.uuid4())[:8]
-    remote = None
-    try:
-        if is_rate_limited(client_ip):
-            push_log(client_ip, "-", 0, "N/A", "BLOCKED", "Rate limit exceeded")
-            roll_series("BLOCKED", 0, 0)
+    def is_rate_limited(self, request_count: int) -> bool:
+        return request_count > self.rate_limit_per_minute
+
+    def detect_intrusion(self, client_ip: str, host: str) -> None:
+        if not self.ids_enabled:
             return
 
-        req = client.recv(8192)
-        if not req:
-            return
-        host, port, protocol, payload = parse_target(req)
-        detect_intrusion(client_ip, host)
+        now = time.time()
+        start = now - 10
+        with self.state_lock:
+            window = self.client_targets_window[client_ip]
+            window.append((now, host))
+            while window and window[0][0] < start:
+                window.popleft()
+            request_count = len(window)
+            distinct_hosts = len({entry_host for _, entry_host in window})
 
-        reason = policy_decision(client_ip, host, port)
-        if reason:
-            push_log(client_ip, host, port, protocol, "BLOCKED", reason)
-            roll_series("BLOCKED", 0, 0)
-            return
+        flood_key = f"{client_ip}:flood"
+        if request_count > 60 and now - self.last_alert_by_key[flood_key] > 20:
+            self.last_alert_by_key[flood_key] = now
+            self.push_alert(
+                "IDS",
+                f"Possible flood from {client_ip}: {request_count} requests in 10 seconds",
+                client_ip=client_ip,
+                severity="HIGH",
+            )
 
-        t = time.time()
-        with state_lock:
-            connection_table[conn_id] = ConnectionState(conn_id, client_ip, host, port, protocol, "NEW", t, t)
+        scan_key = f"{client_ip}:scan"
+        if distinct_hosts > 25 and now - self.last_alert_by_key[scan_key] > 20:
+            self.last_alert_by_key[scan_key] = now
+            self.push_alert(
+                "IDS",
+                f"Possible scan from {client_ip}: {distinct_hosts} targets in 10 seconds",
+                client_ip=client_ip,
+                severity="MEDIUM",
+            )
 
-        remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        remote.settimeout(8)
-        remote.connect((host, port))
-        remote.settimeout(None)
-        with state_lock:
-            connection_table[conn_id].state = "ESTABLISHED"
+    def dpi_match(self, payload: bytes) -> Optional[str]:
+        if not self.dpi_enabled or not payload:
+            return None
 
-        if protocol == "HTTPS":
-            client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        elif payload:
-            remote.sendall(payload)
+        lowered_payload = payload.lower()
+        for signature in self.dpi_signatures:
+            if signature in lowered_payload:
+                return f"DPI matched signature: {signature.decode(errors='ignore')}"
+        if b"select " in lowered_payload and b" union " in lowered_payload:
+            return "DPI suspicious SQL injection sequence"
+        return None
 
-        up, down = tunnel(conn_id, client, remote)
-        push_log(client_ip, host, port, protocol, "ALLOWED", up=up, down=down)
-        roll_series("ALLOWED", up, down)
-        with state_lock:
-            host_counter[host] += 1
-    except Exception as exc:  # noqa: BLE001
-        push_log(client_ip, "-", 0, "N/A", "BLOCKED", str(exc))
-        roll_series("BLOCKED", 0, 0)
-    finally:
-        with state_lock:
-            c = connection_table.get(conn_id)
-            if c:
-                c.state = "CLOSED"
-                c.last_seen = time.time()
+    def time_rule_hit(self, host: str) -> Optional[str]:
+        now = datetime.now()
+        current_day = now.weekday()
+        current_hour = now.hour
+
+        with self.state_lock:
+            rules = list(self.schedule_rules.values())
+
+        for rule in rules:
+            if not rule.enabled or rule.keyword not in host or current_day not in rule.days:
+                continue
+
+            if rule.start_hour < rule.end_hour:
+                in_window = rule.start_hour <= current_hour < rule.end_hour
+            else:
+                in_window = current_hour >= rule.start_hour or current_hour < rule.end_hour
+
+            if in_window:
+                return f"Time rule ({rule.keyword} {rule.start_hour:02d}-{rule.end_hour:02d})"
+        return None
+
+    def parse_target(self, data: bytes) -> Tuple[str, int, str, bytes]:
+        lines = data.split(b"\r\n")
+        if not lines or len(lines[0].split()) < 2:
+            raise ValueError("Bad request line")
+
+        method = lines[0].split()[0].decode(errors="ignore").upper()
+        if method == "CONNECT":
+            hostport = lines[0].split()[1].decode(errors="ignore")
+            host, port = hostport.rsplit(":", 1)
+            return self.normalize_domain(host), int(port), "HTTPS", b""
+
+        host_header = ""
+        for line in lines[1:]:
+            if line.lower().startswith(b"host:"):
+                host_header = line.split(b":", 1)[1].strip().decode(errors="ignore")
+                break
+
+        if not host_header:
+            raise ValueError("Missing Host header")
+
+        if ":" in host_header:
+            host, port = host_header.rsplit(":", 1)
+            return self.normalize_domain(host), int(port), "HTTP", data
+
+        return self.normalize_domain(host_header), 80, "HTTP", data
+
+    def policy_decision(self, client_ip: str, host: str, port: int) -> Optional[str]:
+        if client_ip in self.blocked_ips:
+            return "Blocked source IP"
+        if port in self.blocked_ports:
+            return f"Blocked destination port {port}"
+        if any(site in host for site in self.blocked_sites):
+            return "Blocked by site policy"
+
+        time_rule_reason = self.time_rule_hit(host)
+        if time_rule_reason:
+            return time_rule_reason
+        return None
+
+    def build_features(self, client_ip: str, port: int, request_size: int) -> Dict:
+        # These are the exact features requested for the ML detector.
+        requests_per_ip, request_frequency = self.register_request(client_ip)
+        return {
+            "requests_per_ip": requests_per_ip,
+            "request_frequency": request_frequency,
+            "packet_size": int(request_size),
+            "port_number": int(port),
+        }
+
+    def handle_anomaly(self, client_ip: str, features: Dict) -> bool:
+        if not self.anomaly_detection_enabled:
+            return False
+
+        if self.anomaly_detector.detect_anomaly(features) != "ANOMALY":
+            return False
+
+        severity = self.alert_system.calculate_severity(features)
+        alert = self.alert_system.trigger_alert(
+            ip=client_ip,
+            features=features,
+            severity=severity,
+            reason="Isolation Forest flagged traffic as unusual",
+        )
+        with self.state_lock:
+            self.alerts.appendleft(alert)
+            self.anomaly_counter[client_ip] += 1
+            repeat_count = self.anomaly_counter[client_ip]
+
+        if self.auto_block_enabled and repeat_count >= self.auto_block_threshold:
+            with self.state_lock:
+                self.blocked_ips.add(client_ip)
+            self.push_alert(
+                "AUTO_BLOCK",
+                f"IP {client_ip} was blocked after repeated anomalies",
+                client_ip=client_ip,
+                severity="HIGH",
+                reason="Repeated anomaly detections",
+                features=features,
+            )
+
+        return True
+
+    def tunnel(self, conn_id: str, client: socket.socket, remote: socket.socket) -> Tuple[int, int]:
+        sockets = [client, remote]
+        upload_bytes = 0
+        download_bytes = 0
+
+        while True:
+            ready, _, _ = select.select(sockets, [], [], 2)
+            if not ready:
+                with self.state_lock:
+                    connection = self.connection_table.get(conn_id)
+                    if connection:
+                        connection.last_seen = time.time()
+                continue
+
+            for source_socket in ready:
+                chunk = source_socket.recv(8192)
+                if not chunk:
+                    return upload_bytes, download_bytes
+
+                dpi_result = self.dpi_match(chunk)
+                if dpi_result:
+                    self.push_alert("DPI", dpi_result, severity="MEDIUM")
+                    return upload_bytes, download_bytes
+
+                if source_socket is client:
+                    remote.sendall(chunk)
+                    upload_bytes += len(chunk)
+                    with self.state_lock:
+                        connection = self.connection_table.get(conn_id)
+                        if connection:
+                            connection.up += len(chunk)
+                            connection.up_packets += 1
+                            connection.last_seen = time.time()
+                else:
+                    client.sendall(chunk)
+                    download_bytes += len(chunk)
+                    with self.state_lock:
+                        connection = self.connection_table.get(conn_id)
+                        if connection:
+                            connection.down += len(chunk)
+                            connection.down_packets += 1
+                            connection.last_seen = time.time()
+
+    def handle_client(self, client: socket.socket, addr: Tuple[str, int]) -> None:
+        client_ip = addr[0]
+        connection_id = str(uuid.uuid4())[:8]
+        remote: Optional[socket.socket] = None
+        anomaly_detected = False
+
         try:
-            client.close()
-        except OSError:
-            pass
-        if remote:
+            request_bytes = client.recv(8192)
+            if not request_bytes:
+                return
+
+            host, port, protocol, payload = self.parse_target(request_bytes)
+            self.detect_intrusion(client_ip, host)
+
+            # Extract traffic features before we apply policy decisions so the
+            # detector sees the incoming request pattern in real time.
+            features = self.build_features(client_ip, port, len(request_bytes))
+            anomaly_detected = self.handle_anomaly(client_ip, features)
+
+            if self.is_rate_limited(features["requests_per_ip"]):
+                severity = self.alert_system.calculate_severity(features)
+                rate_alert = self.alert_system.trigger_alert(
+                    ip=client_ip,
+                    features=features,
+                    severity=severity,
+                    reason="Rate limit exceeded",
+                )
+                with self.state_lock:
+                    self.alerts.appendleft(rate_alert)
+                self.push_log(client_ip, host, port, protocol, "BLOCKED", "Rate limit exceeded")
+                self.roll_series("BLOCKED", 0, 0, anomaly_count=1 if anomaly_detected else 0)
+                return
+
+            policy_reason = self.policy_decision(client_ip, host, port)
+            if policy_reason:
+                self.push_log(client_ip, host, port, protocol, "BLOCKED", policy_reason)
+                self.roll_series("BLOCKED", 0, 0, anomaly_count=1 if anomaly_detected else 0)
+                return
+
+            opened_at = time.time()
+            with self.state_lock:
+                self.connection_table[connection_id] = ConnectionState(
+                    connection_id=connection_id,
+                    client_ip=client_ip,
+                    target_host=host,
+                    target_port=port,
+                    protocol=protocol,
+                    state="NEW",
+                    opened_at=opened_at,
+                    last_seen=opened_at,
+                )
+
+            remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            remote.settimeout(8)
+            remote.connect((host, port))
+            remote.settimeout(None)
+
+            with self.state_lock:
+                self.connection_table[connection_id].state = "ESTABLISHED"
+
+            if protocol == "HTTPS":
+                client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            elif payload:
+                remote.sendall(payload)
+
+            upload_bytes, download_bytes = self.tunnel(connection_id, client, remote)
+            self.push_log(
+                client_ip,
+                host,
+                port,
+                protocol,
+                "ALLOWED",
+                up=upload_bytes,
+                down=download_bytes,
+            )
+            self.roll_series(
+                "ALLOWED",
+                upload_bytes,
+                download_bytes,
+                anomaly_count=1 if anomaly_detected else 0,
+            )
+            with self.state_lock:
+                self.host_counter[host] += 1
+        except Exception as exc:  # noqa: BLE001
+            self.push_log(client_ip, "-", 0, "N/A", "BLOCKED", str(exc))
+            self.roll_series("BLOCKED", 0, 0, anomaly_count=1 if anomaly_detected else 0)
+        finally:
+            with self.state_lock:
+                connection = self.connection_table.get(connection_id)
+                if connection:
+                    connection.state = "CLOSED"
+                    connection.last_seen = time.time()
             try:
-                remote.close()
+                client.close()
             except OSError:
                 pass
+            if remote:
+                try:
+                    remote.close()
+                except OSError:
+                    pass
 
+    def start_proxy(self) -> None:
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((self.proxy_host, self.proxy_port))
+        server.listen(256)
+        print(f"[proxy] running on {self.proxy_host}:{self.proxy_port}")
 
-def start_proxy() -> None:
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((PROXY_HOST, PROXY_PORT))
-    srv.listen(256)
-    print(f"[proxy] running on {PROXY_HOST}:{PROXY_PORT}")
-    while True:
-        c, addr = srv.accept()
-        threading.Thread(target=handle_client, args=(c, addr), daemon=True).start()
+        while True:
+            client, addr = server.accept()
+            threading.Thread(target=self.handle_client, args=(client, addr), daemon=True).start()
 
+    def seed_defaults(self) -> None:
+        default_rule = TimeRule(
+            rule_id=str(uuid.uuid4())[:8],
+            keyword="social",
+            start_hour=9,
+            end_hour=17,
+            days=[0, 1, 2, 3, 4],
+            enabled=False,
+        )
+        with self.state_lock:
+            self.schedule_rules[default_rule.rule_id] = default_rule
 
-app = Flask(__name__)
-
-
-HTML = """
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Firewall Dashboard</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
-<style>
-body{font-family:Segoe UI,Trebuchet MS,sans-serif;background:#0d1b2a;color:#eaf4ff;margin:0;padding:18px}
-.grid{display:grid;grid-template-columns:repeat(4,minmax(180px,1fr));gap:10px}.card{background:#1b263b;border:1px solid #3b4d6b;border-radius:10px;padding:10px}
-.row{display:grid;grid-template-columns:2fr 1fr;gap:10px;margin-top:10px}.row2{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}
-input,select,button{width:100%;padding:8px;border-radius:8px;border:1px solid #466387;background:#10213a;color:#eaf4ff} button{cursor:pointer;background:#0077b6;border:none}
-table{width:100%;border-collapse:collapse;font-size:12px}th,td{border-bottom:1px solid #334862;padding:6px;text-align:left}th{color:#90e0ef}
-.t{max-height:250px;overflow:auto}.chips{display:flex;flex-wrap:wrap;gap:6px}.chip{background:#10213a;border:1px solid #466387;border-radius:999px;padding:5px 8px}
-@media(max-width:1000px){.grid{grid-template-columns:repeat(2,minmax(130px,1fr))}.row,.row2{grid-template-columns:1fr}}
-</style></head><body>
-<h2>Proxy Firewall SOC Dashboard</h2>
-<div class="grid">
-<div class="card"><div>Total</div><h3 id="mTotal">0</h3></div>
-<div class="card"><div>Allowed</div><h3 id="mAllowed">0</h3></div>
-<div class="card"><div>Blocked</div><h3 id="mBlocked">0</h3></div>
-<div class="card"><div>Open Sessions</div><h3 id="mOpen">0</h3></div>
-</div>
-<div class="row">
-<div class="card"><h3>Traffic Timeline</h3><canvas id="c1"></canvas></div>
-<div class="card"><h3>Top Domains</h3><canvas id="c2"></canvas></div>
-</div>
-<div class="row2">
-<div class="card"><h3>Block Sites</h3><form id="fSite"><input id="site" placeholder="example.com"><div style="height:8px"></div><button>Add</button></form><div id="sites" class="chips" style="margin-top:8px"></div></div>
-<div class="card"><h3>Settings</h3><form id="fSet"><label>Rate Limit / min</label><input type="number" id="rate" min="10" max="5000"><label><input type="checkbox" id="ids" style="width:auto"> IDS</label><label><input type="checkbox" id="dpi" style="width:auto"> DPI</label><button>Save</button></form></div>
-</div>
-<div class="row2">
-<div class="card"><h3>Time-based Rule</h3><form id="fRule"><input id="rk" placeholder="keyword/domain"><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px"><input id="rs" type="number" min="0" max="23" value="9"><input id="re" type="number" min="0" max="23" value="17"></div><select id="rd" multiple size="7" style="margin-top:8px"><option value="0" selected>Mon</option><option value="1" selected>Tue</option><option value="2" selected>Wed</option><option value="3" selected>Thu</option><option value="4" selected>Fri</option><option value="5">Sat</option><option value="6">Sun</option></select><button style="margin-top:8px">Add Rule</button></form></div>
-<div class="card"><h3>Active Rules</h3><div class="t"><table><thead><tr><th>Key</th><th>Window</th><th>Days</th><th>State</th><th>Action</th></tr></thead><tbody id="rules"></tbody></table></div></div>
-</div>
-<div class="card" style="margin-top:10px"><h3>Alerts</h3><div class="t"><table><thead><tr><th>Time</th><th>Type</th><th>Client</th><th>Message</th></tr></thead><tbody id="alerts"></tbody></table></div></div>
-<div class="card" style="margin-top:10px"><h3>Stateful Table</h3><div class="t"><table><thead><tr><th>ID</th><th>Client</th><th>Target</th><th>Proto</th><th>State</th><th>Up</th><th>Down</th><th>Last</th></tr></thead><tbody id="state"></tbody></table></div></div>
-<div class="card" style="margin-top:10px"><h3>Logs</h3><div class="t"><table><thead><tr><th>Time</th><th>Client</th><th>Host</th><th>Port</th><th>P</th><th>Action</th><th>Reason</th><th>Up</th><th>Down</th></tr></thead><tbody id="logs"></tbody></table></div></div>
-<script>
-const c1 = new Chart(document.getElementById('c1'),{type:'line',data:{labels:[],datasets:[{label:'Allowed',data:[],borderColor:'#27ae60'},{label:'Blocked',data:[],borderColor:'#e63946'},{label:'UpKB',data:[],borderColor:'#00b4d8'},{label:'DownKB',data:[],borderColor:'#90e0ef'}]}});
-const c2 = new Chart(document.getElementById('c2'),{type:'bar',data:{labels:[],datasets:[{label:'Hits',data:[],backgroundColor:'#00b4d8'}]}});
-const d=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
-const q=(u,o)=>fetch(u,o).then(r=>r.json());
-async function refresh(){
-const s=await q('/api/summary');mTotal.textContent=s.total_requests;mAllowed.textContent=s.allowed;mBlocked.textContent=s.blocked;mOpen.textContent=s.open_connections;
-const ts=await q('/api/traffic/series');c1.data.labels=ts.map(x=>x.minute);c1.data.datasets[0].data=ts.map(x=>x.allowed);c1.data.datasets[1].data=ts.map(x=>x.blocked);c1.data.datasets[2].data=ts.map(x=>Math.round(x.up/102.4)/10);c1.data.datasets[3].data=ts.map(x=>Math.round(x.down/102.4)/10);c1.update();
-const top=await q('/api/traffic/top-domains');c2.data.labels=top.map(x=>x.host);c2.data.datasets[0].data=top.map(x=>x.count);c2.update();
-const cfg=await q('/api/config');rate.value=cfg.rate_limit;ids.checked=cfg.ids_enabled;dpi.checked=cfg.dpi_enabled;
-sites.innerHTML=cfg.blocked_sites.map(x=>`<span class=chip>${x} <button onclick="delSite('${encodeURIComponent(x)}')">x</button></span>`).join('');
-rules.innerHTML=cfg.time_rules.map(r=>`<tr><td>${r.keyword}</td><td>${String(r.start_hour).padStart(2,'0')}-${String(r.end_hour).padStart(2,'0')}</td><td>${r.days.map(x=>d[x]).join(',')}</td><td>${r.enabled?'ON':'OFF'}</td><td><button onclick="tg('${r.rule_id}')">toggle</button><button onclick="dr('${r.rule_id}')">del</button></td></tr>`).join('');
-const al=await q('/api/alerts?limit=60');alerts.innerHTML=al.map(x=>`<tr><td>${x.time}</td><td>${x.category}</td><td>${x.client_ip}</td><td>${x.message}</td></tr>`).join('');
-const st=await q('/api/stateful?limit=150');state.innerHTML=st.map(x=>`<tr><td>${x.connection_id}</td><td>${x.client_ip}</td><td>${x.target_host}:${x.target_port}</td><td>${x.protocol}</td><td>${x.state}</td><td>${x.up}</td><td>${x.down}</td><td>${x.last_seen_human}</td></tr>`).join('');
-const lg=await q('/api/logs?limit=120');logs.innerHTML=lg.map(x=>`<tr><td>${x.time}</td><td>${x.client_ip}</td><td>${x.host}</td><td>${x.port}</td><td>${x.protocol}</td><td>${x.action}</td><td>${x.reason}</td><td>${x.up}</td><td>${x.down}</td></tr>`).join('');
-}
-async function delSite(s){await q('/api/block-sites/'+s,{method:'DELETE'});refresh()}
-async function tg(id){await q('/api/time-rules/'+id+'/toggle',{method:'PATCH'});refresh()}
-async function dr(id){await q('/api/time-rules/'+id,{method:'DELETE'});refresh()}
-fSite.onsubmit=async e=>{e.preventDefault();await q('/api/block-sites',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({site:site.value})});site.value='';refresh()}
-fSet.onsubmit=async e=>{e.preventDefault();await q('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rate_limit:Number(rate.value),ids_enabled:ids.checked,dpi_enabled:dpi.checked})});refresh()}
-fRule.onsubmit=async e=>{e.preventDefault();const days=[...rd.options].filter(o=>o.selected).map(o=>Number(o.value));await q('/api/time-rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keyword:rk.value,start_hour:Number(rs.value),end_hour:Number(re.value),days})});rk.value='';refresh()}
-refresh();setInterval(refresh,3000);
-</script></body></html>
-"""
-
-
-@app.get("/")
-def dashboard():
-    return render_template_string(HTML)
-
-
-@app.get("/api/summary")
-def api_summary():
-    with state_lock:
-        total = sum(action_counter.values())
-        open_conn = sum(1 for x in connection_table.values() if x.state in {"NEW", "ESTABLISHED"})
-        return jsonify(
-            {
+    def get_summary(self) -> Dict:
+        with self.state_lock:
+            total = sum(self.action_counter.values())
+            open_connections = sum(
+                1 for item in self.connection_table.values() if item.state in {"NEW", "ESTABLISHED"}
+            )
+            return {
                 "total_requests": total,
-                "allowed": action_counter.get("ALLOWED", 0),
-                "blocked": action_counter.get("BLOCKED", 0),
-                "open_connections": open_conn,
-                "alert_count": len(alerts),
-                "rate_limit": RATE_LIMIT_PER_MINUTE,
-                "ids_enabled": IDS_ENABLED,
-                "dpi_enabled": DPI_ENABLED,
+                "allowed": self.action_counter.get("ALLOWED", 0),
+                "blocked": self.action_counter.get("BLOCKED", 0),
+                "total_anomalies": sum(self.anomaly_counter.values()),
+                "blocked_ips": len(self.blocked_ips),
+                "open_connections": open_connections,
+                "rate_limit": self.rate_limit_per_minute,
+                "ids_enabled": self.ids_enabled,
+                "dpi_enabled": self.dpi_enabled,
+                "anomaly_detection_enabled": self.anomaly_detection_enabled,
+                "auto_block_enabled": self.auto_block_enabled,
             }
-        )
 
+    def get_logs(self, limit: int = 100) -> List[Dict]:
+        with self.state_lock:
+            return list(self.logs)[:limit]
 
-@app.get("/api/logs")
-def api_logs():
-    limit = max(1, min(int(request.args.get("limit", 100)), 500))
-    with state_lock:
-        return jsonify(list(logs)[:limit])
+    def get_alerts(self, limit: int = 100) -> List[Dict]:
+        with self.state_lock:
+            return list(self.alerts)[:limit]
 
+    def get_stateful_connections(self, limit: int = 120) -> List[Dict]:
+        with self.state_lock:
+            rows = sorted(self.connection_table.values(), key=lambda item: item.last_seen, reverse=True)[:limit]
 
-@app.get("/api/alerts")
-def api_alerts():
-    limit = max(1, min(int(request.args.get("limit", 100)), 500))
-    with state_lock:
-        return jsonify(list(alerts)[:limit])
-
-
-@app.get("/api/stateful")
-def api_stateful():
-    limit = max(1, min(int(request.args.get("limit", 120)), 500))
-    with state_lock:
-        rows = sorted(connection_table.values(), key=lambda x: x.last_seen, reverse=True)[:limit]
         result = []
-        for r in rows:
-            d = asdict(r)
-            d["last_seen_human"] = datetime.fromtimestamp(r.last_seen).strftime("%H:%M:%S")
-            result.append(d)
-        return jsonify(result)
+        for row in rows:
+            row_dict = asdict(row)
+            row_dict["last_seen_human"] = datetime.fromtimestamp(row.last_seen).strftime("%H:%M:%S")
+            result.append(row_dict)
+        return result
 
+    def get_top_domains(self, limit: int = 10) -> List[Dict]:
+        with self.state_lock:
+            return [{"host": host, "count": count} for host, count in self.host_counter.most_common(limit)]
 
-@app.get("/api/traffic/top-domains")
-def api_top_domains():
-    with state_lock:
-        return jsonify([{"host": h, "count": c} for h, c in host_counter.most_common(10)])
+    def get_traffic_series(self) -> List[Dict]:
+        with self.state_lock:
+            return list(self.traffic_series)
 
+    def get_suspicious_ips(self, limit: int = 20) -> List[Dict]:
+        with self.state_lock:
+            items = self.anomaly_counter.most_common(limit)
+            return [
+                {
+                    "ip": ip,
+                    "anomalies": count,
+                    "blocked": ip in self.blocked_ips,
+                }
+                for ip, count in items
+            ]
 
-@app.get("/api/traffic/series")
-def api_traffic_series():
-    with state_lock:
-        return jsonify(list(traffic_series))
-
-
-@app.get("/api/config")
-def api_config():
-    with state_lock:
-        return jsonify(
-            {
-                "rate_limit": RATE_LIMIT_PER_MINUTE,
-                "ids_enabled": IDS_ENABLED,
-                "dpi_enabled": DPI_ENABLED,
-                "blocked_sites": sorted(BLOCKED_SITES),
-                "time_rules": [asdict(x) for x in schedule_rules.values()],
+    def get_config(self) -> Dict:
+        with self.state_lock:
+            return {
+                "rate_limit": self.rate_limit_per_minute,
+                "ids_enabled": self.ids_enabled,
+                "dpi_enabled": self.dpi_enabled,
+                "anomaly_detection_enabled": self.anomaly_detection_enabled,
+                "auto_block_enabled": self.auto_block_enabled,
+                "blocked_ips": sorted(self.blocked_ips),
+                "blocked_sites": sorted(self.blocked_sites),
+                "time_rules": [asdict(rule) for rule in self.schedule_rules.values()],
             }
+
+    def update_settings(self, payload: Dict) -> Dict:
+        if "rate_limit" in payload:
+            rate_limit = int(payload["rate_limit"])
+            if rate_limit < 10 or rate_limit > 5000:
+                raise ValueError("rate_limit must be between 10 and 5000")
+            self.rate_limit_per_minute = rate_limit
+        if isinstance(payload.get("ids_enabled"), bool):
+            self.ids_enabled = payload["ids_enabled"]
+        if isinstance(payload.get("dpi_enabled"), bool):
+            self.dpi_enabled = payload["dpi_enabled"]
+        if isinstance(payload.get("anomaly_detection_enabled"), bool):
+            self.anomaly_detection_enabled = payload["anomaly_detection_enabled"]
+        if isinstance(payload.get("auto_block_enabled"), bool):
+            self.auto_block_enabled = payload["auto_block_enabled"]
+        return self.get_config()
+
+    def add_blocked_ip(self, ip: str) -> str:
+        if not ip:
+            raise ValueError("ip is required")
+        with self.state_lock:
+            self.blocked_ips.add(ip)
+        return ip
+
+    def remove_blocked_ip(self, ip: str) -> None:
+        with self.state_lock:
+            self.blocked_ips.discard(ip)
+
+    def add_blocked_site(self, site: str) -> str:
+        normalized_site = self.normalize_domain(site)
+        if not normalized_site:
+            raise ValueError("site is required")
+        with self.state_lock:
+            self.blocked_sites.add(normalized_site)
+        return normalized_site
+
+    def remove_blocked_site(self, site: str) -> None:
+        with self.state_lock:
+            self.blocked_sites.discard(self.normalize_domain(site))
+
+    def add_time_rule(self, payload: Dict) -> Dict:
+        keyword = self.normalize_domain(payload.get("keyword", ""))
+        if not keyword:
+            raise ValueError("keyword is required")
+
+        start_hour = int(payload.get("start_hour"))
+        end_hour = int(payload.get("end_hour"))
+        if not (0 <= start_hour <= 23 and 0 <= end_hour <= 23):
+            raise ValueError("hours must be in range 0..23")
+
+        day_values = payload.get("days", [])
+        if not isinstance(day_values, list) or not day_values:
+            raise ValueError("days must be a non-empty list")
+
+        days = sorted({int(day) for day in day_values})
+        if any(day < 0 or day > 6 for day in days):
+            raise ValueError("days values must be in range 0..6")
+
+        rule = TimeRule(
+            rule_id=str(uuid.uuid4())[:8],
+            keyword=keyword,
+            start_hour=start_hour,
+            end_hour=end_hour,
+            days=days,
+            enabled=True,
         )
+        with self.state_lock:
+            self.schedule_rules[rule.rule_id] = rule
+        return asdict(rule)
+
+    def toggle_time_rule(self, rule_id: str) -> Dict:
+        with self.state_lock:
+            rule = self.schedule_rules.get(rule_id)
+            if not rule:
+                raise KeyError("rule not found")
+            rule.enabled = not rule.enabled
+            return asdict(rule)
+
+    def delete_time_rule(self, rule_id: str) -> None:
+        with self.state_lock:
+            if rule_id not in self.schedule_rules:
+                raise KeyError("rule not found")
+            del self.schedule_rules[rule_id]
 
 
-@app.post("/api/block-sites")
-def api_add_site():
-    payload = request.get_json(silent=True) or {}
-    site = normalize_domain(payload.get("site", ""))
-    if not site:
-        return jsonify({"error": "site is required"}), 400
-    with state_lock:
-        BLOCKED_SITES.add(site)
-    return jsonify({"ok": True, "site": site})
+def main() -> None:
+    from dashboard import start_dashboard
 
-
-@app.delete("/api/block-sites/<path:site>")
-def api_del_site(site: str):
-    with state_lock:
-        BLOCKED_SITES.discard(normalize_domain(site))
-    return jsonify({"ok": True})
-
-
-@app.post("/api/settings")
-def api_settings():
-    global RATE_LIMIT_PER_MINUTE, IDS_ENABLED, DPI_ENABLED
-    payload = request.get_json(silent=True) or {}
-    rl = payload.get("rate_limit")
-    if rl is not None:
-        rl = int(rl)
-        if rl < 10 or rl > 5000:
-            return jsonify({"error": "rate_limit must be 10..5000"}), 400
-        RATE_LIMIT_PER_MINUTE = rl
-    if isinstance(payload.get("ids_enabled"), bool):
-        IDS_ENABLED = payload["ids_enabled"]
-    if isinstance(payload.get("dpi_enabled"), bool):
-        DPI_ENABLED = payload["dpi_enabled"]
-    return jsonify({"ok": True})
-
-
-@app.post("/api/time-rules")
-def api_add_time_rule():
-    payload = request.get_json(silent=True) or {}
-    keyword = normalize_domain(payload.get("keyword", ""))
-    if not keyword:
-        return jsonify({"error": "keyword is required"}), 400
-    try:
-        sh = int(payload.get("start_hour"))
-        eh = int(payload.get("end_hour"))
-    except Exception:  # noqa: BLE001
-        return jsonify({"error": "hours must be numbers"}), 400
-    if not (0 <= sh <= 23 and 0 <= eh <= 23):
-        return jsonify({"error": "hours must be 0..23"}), 400
-    days_raw = payload.get("days", [])
-    if not isinstance(days_raw, list) or not days_raw:
-        return jsonify({"error": "days must be non-empty list"}), 400
-    days: List[int] = []
-    for d in days_raw:
-        di = int(d)
-        if di < 0 or di > 6:
-            return jsonify({"error": "days values must be 0..6"}), 400
-        days.append(di)
-    rule = TimeRule(str(uuid.uuid4())[:8], keyword, sh, eh, sorted(set(days)), True)
-    with state_lock:
-        schedule_rules[rule.rule_id] = rule
-    return jsonify({"ok": True, "rule": asdict(rule)})
-
-
-@app.patch("/api/time-rules/<rule_id>/toggle")
-def api_toggle_rule(rule_id: str):
-    with state_lock:
-        r = schedule_rules.get(rule_id)
-        if not r:
-            return jsonify({"error": "rule not found"}), 404
-        r.enabled = not r.enabled
-        return jsonify({"ok": True, "rule": asdict(r)})
-
-
-@app.delete("/api/time-rules/<rule_id>")
-def api_del_rule(rule_id: str):
-    with state_lock:
-        if rule_id not in schedule_rules:
-            return jsonify({"error": "rule not found"}), 404
-        del schedule_rules[rule_id]
-    return jsonify({"ok": True})
-
-
-def start_dashboard() -> None:
-    print(f"[dashboard] http://127.0.0.1:{DASHBOARD_PORT}")
-    app.run(host="127.0.0.1", port=DASHBOARD_PORT, debug=False, use_reloader=False, threaded=True)
-
-
-def seed_defaults() -> None:
-    rule = TimeRule(str(uuid.uuid4())[:8], "social", 9, 17, [0, 1, 2, 3, 4], False)
-    with state_lock:
-        schedule_rules[rule.rule_id] = rule
+    firewall = ProxyFirewall()
+    firewall.seed_defaults()
+    print("[init] Starting Proxy Firewall with ML anomaly detection and dashboard")
+    threading.Thread(
+        target=start_dashboard,
+        args=(firewall,),
+        kwargs={"host": firewall.dashboard_host, "port": firewall.dashboard_port},
+        daemon=True,
+    ).start()
+    firewall.start_proxy()
 
 
 if __name__ == "__main__":
-    print("[init] Starting Stateful Proxy Firewall + SOC Dashboard")
-    seed_defaults()
-    threading.Thread(target=start_dashboard, daemon=True).start()
-    start_proxy()
+    main()
